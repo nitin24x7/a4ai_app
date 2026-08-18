@@ -1,7 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
@@ -55,6 +60,12 @@ class _MainHybridShellState extends State<MainHybridShell> {
   void _initController() {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..addJavaScriptChannel(
+        'BlobDownloader',
+        onMessageReceived: (JavaScriptMessage message) {
+          _handleBlobDownload(message.message);
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (int progress) {
@@ -80,10 +91,9 @@ class _MainHybridShellState extends State<MainHybridShell> {
             }
           },
           onWebResourceError: (WebResourceError error) {
-            // Check for connection/host errors
-            if (error.errorCode == -2 || // ERR_INTERNET_DISCONNECTED
-                error.errorCode == -6 || // ERR_CONNECTION_REFUSED
-                error.errorCode == -8 || // ERR_CONNECTION_TIMED_OUT
+            if (error.errorCode == -2 ||
+                error.errorCode == -6 ||
+                error.errorCode == -8 ||
                 error.errorType == WebResourceErrorType.hostLookup ||
                 error.errorType == WebResourceErrorType.connect ||
                 error.errorType == WebResourceErrorType.timeout) {
@@ -97,13 +107,37 @@ class _MainHybridShellState extends State<MainHybridShell> {
           },
           onNavigationRequest: (NavigationRequest request) async {
             final uri = Uri.parse(request.url);
+            final urlString = request.url.toLowerCase();
 
-            // Keep internal domain browsing inside the webview
+            // 1. Handle Blob URLs created by React/JS PDF/Doc generators
+            if (urlString.startsWith('blob:')) {
+              _processBlobUrl(request.url);
+              return NavigationDecision.prevent;
+            }
+
+            // 2. Intercept direct file downloads (.pdf, .docx, etc.) and launch externally
+            final isDocument = urlString.endsWith('.pdf') ||
+                urlString.endsWith('.docx') ||
+                urlString.endsWith('.doc') ||
+                urlString.endsWith('.xlsx') ||
+                urlString.endsWith('.csv') ||
+                urlString.endsWith('.zip') ||
+                uri.path.toLowerCase().endsWith('.pdf') ||
+                uri.path.toLowerCase().endsWith('.docx');
+
+            if (isDocument) {
+              if (await canLaunchUrl(uri)) {
+                await launchUrl(uri, mode: LaunchMode.externalApplication);
+                return NavigationDecision.prevent;
+              }
+            }
+
+            // 3. Keep internal domain browsing inside the WebView
             if (uri.host.contains('a4ai.in') || uri.host.contains('supabase.co')) {
               return NavigationDecision.navigate;
             }
 
-            // Open external URLs (whatsapp, mailto, tel, docs) in external applications
+            // 4. Delegate external apps (WhatsApp, phone, mailto, etc.)
             if (await canLaunchUrl(uri)) {
               await launchUrl(uri, mode: LaunchMode.externalApplication);
               return NavigationDecision.prevent;
@@ -115,16 +149,106 @@ class _MainHybridShellState extends State<MainHybridShell> {
       );
 
     if (_controller.platform is AndroidWebViewController) {
+      final AndroidWebViewController androidController =
+          _controller.platform as AndroidWebViewController;
+
       AndroidWebViewController.enableDebugging(true);
-      (_controller.platform as AndroidWebViewController)
-          .setMediaPlaybackRequiresUserGesture(false);
+      androidController.setMediaPlaybackRequiresUserGesture(false);
+      androidController.setOnShowFileSelector(_androidFilePicker);
     }
 
     _controller.loadRequest(Uri.parse(_initialUrl));
   }
 
+  /// Converts a `blob:` URL inside the WebView into base64 data and passes it to Flutter
+  void _processBlobUrl(String blobUrl) {
+    final jsCode = '''
+      (async function() {
+        try {
+          const response = await fetch('$blobUrl');
+          const blob = await response.blob();
+          const reader = new FileReader();
+          reader.onloadend = function() {
+            const base64data = reader.result;
+            const mimeType = blob.type || 'application/pdf';
+            window.BlobDownloader.postMessage(JSON.stringify({
+              data: base64data,
+              mimeType: mimeType,
+              name: 'document_' + Date.now()
+            }));
+          };
+          reader.readAsDataURL(blob);
+        } catch (e) {
+          console.error('Blob download error:', e);
+        }
+      })();
+    ''';
+    _controller.runJavaScript(jsCode);
+  }
+
+  /// Saves the base64 file to device storage and opens it
+  Future<void> _handleBlobDownload(String message) async {
+    try {
+      final Map<String, dynamic> fileInfo = jsonDecode(message);
+      final String rawData = fileInfo['data'] ?? '';
+      final String mimeType = fileInfo['mimeType'] ?? 'application/pdf';
+      final String baseName = fileInfo['name'] ?? 'download';
+
+      if (rawData.isEmpty) return;
+
+      // Extract raw base64 string after the comma (e.g. data:application/pdf;base64,...)
+      final String base64Str = rawData.contains(',') ? rawData.split(',')[1] : rawData;
+      final Uint8List bytes = base64Decode(base64Str);
+
+      String extension = '.pdf';
+      if (mimeType.contains('word') || mimeType.contains('docx')) {
+        extension = '.docx';
+      } else if (mimeType.contains('png')) {
+        extension = '.png';
+      } else if (mimeType.contains('jpeg') || mimeType.contains('jpg')) {
+        extension = '.jpg';
+      }
+
+      final Directory tempDir = await getTemporaryDirectory();
+      final File file = File('${tempDir.path}/$baseName$extension');
+      await file.writeAsBytes(bytes);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Document generated successfully! Opening..."),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+
+      await OpenFile.open(file.path);
+    } catch (e) {
+      debugPrint('Error saving downloaded blob: $e');
+    }
+  }
+
+  Future<List<String>> _androidFilePicker(FileSelectorParams params) async {
+    try {
+      final FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'pdf', 'docx'],
+        allowMultiple: params.mode == FileSelectorMode.openMultiple,
+      );
+
+      if (result != null && result.files.isNotEmpty) {
+        return result.files
+            .where((f) => f.path != null)
+            .map((f) => Uri.file(File(f.path!).path).toString())
+            .toList();
+      }
+    } catch (e) {
+      debugPrint('Error picking file in WebView: $e');
+    }
+    return [];
+  }
+
   void _initNetworkMonitoring() {
-    // Check initial connectivity asynchronously
     Connectivity().checkConnectivity().then((results) {
       if (results.contains(ConnectivityResult.none)) {
         if (mounted) {
@@ -136,7 +260,6 @@ class _MainHybridShellState extends State<MainHybridShell> {
       }
     });
 
-    // Listen to real-time network state changes
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
       final hasNoConnection = results.contains(ConnectivityResult.none);
       if (mounted) {
@@ -178,7 +301,6 @@ class _MainHybridShellState extends State<MainHybridShell> {
           return;
         }
 
-        // Handle page-by-page web navigation
         if (await _controller.canGoBack()) {
           await _controller.goBack();
         } else {
@@ -189,10 +311,7 @@ class _MainHybridShellState extends State<MainHybridShell> {
         body: SafeArea(
           child: Stack(
             children: [
-              // WebView component
               WebViewWidget(controller: _controller),
-
-              // Top progress bar during page load
               if (_isLoading && !_isOffline)
                 Positioned(
                   top: 0,
@@ -205,8 +324,6 @@ class _MainHybridShellState extends State<MainHybridShell> {
                     minHeight: 2.5,
                   ),
                 ),
-
-              // Branded Offline Screen
               if (_isOffline)
                 Positioned.fill(
                   child: A4AIOfflineView(onRetry: _retryConnection),
@@ -233,7 +350,6 @@ class A4AIOfflineView extends StatelessWidget {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // Logo placeholder / asset
           Image.asset(
             'assets/images/logo.png',
             height: 84,
@@ -252,7 +368,6 @@ class A4AIOfflineView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 32),
-
           const Text(
             "No Internet Connection",
             style: TextStyle(
@@ -263,7 +378,6 @@ class A4AIOfflineView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 10),
-
           const Text(
             "Please check your Wi-Fi or mobile data network to continue using a4ai.",
             textAlign: TextAlign.center,
@@ -274,8 +388,6 @@ class A4AIOfflineView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 36),
-
-          // Retry Button
           SizedBox(
             width: double.infinity,
             height: 50,
